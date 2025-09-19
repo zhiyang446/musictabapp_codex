@@ -1,0 +1,18 @@
+﻿# Flutter build outputs
+build/
+.dart_tool/
+.packages
+.melos_tool/
+.flutter-plugins
+.flutter-plugins-dependencies
+pubspec.lock
+# Platform specific
+android/
+ios/
+macos/
+linux/
+windows/
+web/
+# IDE
+.idea/
+.vscode/

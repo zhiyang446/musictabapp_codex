@@ -7,6 +7,7 @@ from sqlalchemy import engine_from_config, pool
 from sqlmodel import SQLModel
 
 from app.core.config import settings
+from app import models  # noqa: F401 確保模型載入
 
 # Alembic 配置物件提供存取 ini 設定
 config = context.config

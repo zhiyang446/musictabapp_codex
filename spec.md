@@ -2,7 +2,8 @@
 
 ## 1. 架構與選型
 - 前端：Flutter 3.x 搭配 Riverpod 處理狀態、Dio 處理 REST API、file_picker 與 permission_handler 支援音檔選擇與權限、youtube_explode_dart 解析 YouTube 影片、flutter_downloader 處理譜面下載。
-- 後端：FastAPI (Python 3.11) 搭配 Pydantic v2、SQLModel 管理資料層、Uvicorn/Gunicorn 作為 ASGI 伺服器、Celery + Redis 處理離線運算；作曲模型採用 basic-pitch、Demucs/Spleeter 做音軌分離、music21 生成 MusicXML、mido/pretty_midi 產出 MIDI、MuseScore CLI 或 LilyPond 將 MusicXML 轉為 PDF。
+    - 核心套件版本：`flutter_riverpod` 2.5、`go_router` 14、`dio` 5.7、`supabase_flutter` 2.7、`flutter_hooks` 0.20。
+- 後端：FastAPI (Python 3.11) 搭配 Pydantic v2、SQLModel 配合 psycopg 驅動管理資料層、Uvicorn/Gunicorn 作為 ASGI 伺服器、Celery + Redis 處理離線運算；作曲模型採用 basic-pitch、Demucs/Spleeter 做音軌分離、music21 生成 MusicXML、mido/pretty_midi 產出 MIDI、MuseScore CLI 或 LilyPond 將 MusicXML 轉為 PDF。
 - 儲存：Supabase Storage 儲存原始音檔與產出譜面；Supabase Postgres 儲存作業、資產與事件紀錄。
 - 鑑權：Supabase Auth 提供使用者登入註冊，前端持 JWT，FastAPI 以 Supabase 提供的 JWKS 驗證令牌。
 - 背景工作：Celery 任務負責音訊下載、轉譜、格式輸出，並以 Webhook/輪詢回報進度。
@@ -15,6 +16,7 @@
     - `backend/app/repositories/`：SQLModel 與 Supabase 查詢封裝，處理交易與錯誤轉換。
     - `backend/app/schemas/`：Pydantic Schema 與回應模型，對應 `api.md` 契約。
     - `backend/app/tasks/`：Celery 任務定義（音訊下載、轉譜、PDF 產生）。
+    - `backend/app/models/`：SQLModel 資料表結構定義，供 ORM 與遷移共用。
     - `backend/app/core/`：設定、依賴注入、Supabase/Redis 客戶端、共用常數。
     - `backend/alembic/`：資料表遷移腳本（與 Supabase schema 對齊）。
     - `backend/pyproject.toml`：Poetry 設定與指令入口，統一管理開發命令。
@@ -29,6 +31,28 @@
 | score_assets | id, job_id(FK), instrument(enum), format(enum: midi,musicxml,pdf), storage_object_path, duration_seconds, page_count, created_at | 每個作業產出的檔案資源。|
 | processing_metrics | id, job_id(FK), latency_ms, cpu_usage, memory_mb, model_versions(jsonb), created_at | 蒐集性能與版本資訊，用於監控與回溯。|
 | presets | id, name, description, instrument_modes(jsonb), tempo_hint, visibility(enum: public,private) | 預設配置，讓使用者快速選擇常用樂器組合。|
+
+* 所有 user_id 外鍵對應 Supabase `auth.users.id` (雲端環境由 Supabase Auth 管理)。
+### 資料表欄位與索引規格
+- `profiles`
+  - 欄位：`user_id UUID`(PK/FK to users.id)、`display_name TEXT`、`avatar_url TEXT`、`created_at TIMESTAMPTZ`
+  - 約束：`user_id` 唯一；外鍵採 `ON DELETE CASCADE`
+- `transcription_jobs`
+  - 欄位：`id UUID`(PK)、`user_id UUID`(FK)、`source_type TEXT CHECK (local|youtube)`、`source_uri TEXT`、`storage_object_path TEXT`、`instrument_modes JSONB`、`model_profile TEXT`、`status TEXT`、`progress REAL DEFAULT 0`、`error_message TEXT`、`created_at TIMESTAMPTZ DEFAULT now()`、`updated_at TIMESTAMPTZ DEFAULT now()`
+  - 索引：`user_id`、`status`、`created_at DESC`；具備 `updated_at` 自動更新觸發器
+- `job_events`
+  - 欄位：`id UUID`(PK)、`job_id UUID`(FK)、`stage TEXT`、`message TEXT`、`payload JSONB`、`created_at TIMESTAMPTZ DEFAULT now()`
+  - 索引：`job_id, created_at` 組合索引
+- `score_assets`
+  - 欄位：`id UUID`(PK)、`job_id UUID`(FK)、`instrument TEXT`、`format TEXT`、`storage_object_path TEXT`、`duration_seconds INT`、`page_count INT`、`created_at TIMESTAMPTZ DEFAULT now()`
+  - 約束：對 (`job_id`,`instrument`,`format`) 建立唯一鍵避免重複輸出
+- `processing_metrics`
+  - 欄位：`id UUID`(PK)、`job_id UUID`(FK)、`latency_ms INT`、`cpu_usage REAL`、`memory_mb REAL`、`model_versions JSONB`、`created_at TIMESTAMPTZ DEFAULT now()`
+  - 索引：`job_id`
+- `presets`
+  - 欄位：`id UUID`(PK)、`user_id UUID NULL`、`name TEXT`、`description TEXT`、`instrument_modes JSONB`、`tempo_hint INT`、`visibility TEXT DEFAULT "private"`
+  - 約束：`visibility` ENUM(`public`,`private`)，`user_id` 為 NULL 表示公共預設；`user_id`+`name` 唯一
+
 
 ## 3. 關鍵流程
 1. 使用者登入：Flutter 透過 Supabase Auth 登入，儲存 access token。 
@@ -88,6 +112,23 @@ graph LR
     CeleryWorker -->|模型推論| MLModels[(音訊/樂譜模型)]
     User -->|下載成果| Supabase
 `
+
+
+### 背景工作任務架構
+- 作業建立：`POST /v1/jobs` 接受 `sourceType`、`instrumentModes` 等參數，預設建立 `pending` 狀態作業並回傳 `JobResource`。
+- Celery 啟動參數：`backend/app/core/celery_app.py` 定義 Celery 實例，Broker/Result backend 採 Redis；使用 `CELERY_` 環境變數覆寫。
+- 任務流程：`process_transcription_job` 任務負責 orchestrator，呼叫子任務步驟（下載/上傳/轉譜/產出），並透過 `job_events` 紀錄進度。
+- 事件推播：任務達成關鍵里程碑時呼叫 `NotificationService.emit_event`；若整合 WebSocket/SSE，可即時更新前端。
+- 錯誤與重試：任務採 `autoretry_for` 搭配自訂例外分類，錯誤時更新 `transcription_jobs.status=failed` 並寫入 `error_message`。
+- 排程作業：`backend/app/core/celery_beat.py` 保留擴充空間，供定期掃描卡住任務或清理暫存檔。
+
+### 前端初始化概要
+- 專案目錄：`frontend/` 採 Flutter 結構，分層為 `lib/core`（共用常數、providers）、`lib/routes`（GoRouter 設定）、`lib/features`（功能模組）與 `lib/widgets`。
+- 首批頁面：`SplashPage` 顯示啟動畫面與初始化 Supabase、`AuthGate` 依登入狀態導向、`HomeShell` 提供 Tab Scaffold 與任務列表 placeholder。
+- 狀態管理：使用 Riverpod + hooks 封裝 `AppBootstrapProvider`、`SupabaseClientProvider`，共用狀態集中於 `lib/core/providers.dart`。
+- 路由策略：使用 `go_router` 定義 `/`（Splash）、`/jobs`（作業列表）、`/jobs/:id`（詳情 placeholder），支援深層連結。
+- 主題設定：整合 `ThemeData` 與自訂 `AppColors`，確保暗/亮模式一致性；基礎元件放在 `lib/widgets` 以利重複使用。
+- README：`frontend/README.md` 說明開發啟動指令（`flutter pub get`、`flutter run`）與必要工具。
 
 ## 6. 容器/部署概觀
 `mermaid
@@ -250,4 +291,5 @@ stateDiagram-v2
     rendering --> failed: 產出失敗
     failed --> pending: 使用者重新提交
     completed --> [*]
-`
+`
+
