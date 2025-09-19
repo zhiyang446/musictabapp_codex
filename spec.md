@@ -1,0 +1,253 @@
+﻿# 音樂轉譜系統規格
+
+## 1. 架構與選型
+- 前端：Flutter 3.x 搭配 Riverpod 處理狀態、Dio 處理 REST API、file_picker 與 permission_handler 支援音檔選擇與權限、youtube_explode_dart 解析 YouTube 影片、flutter_downloader 處理譜面下載。
+- 後端：FastAPI (Python 3.11) 搭配 Pydantic v2、SQLModel 管理資料層、Uvicorn/Gunicorn 作為 ASGI 伺服器、Celery + Redis 處理離線運算；作曲模型採用 basic-pitch、Demucs/Spleeter 做音軌分離、music21 生成 MusicXML、mido/pretty_midi 產出 MIDI、MuseScore CLI 或 LilyPond 將 MusicXML 轉為 PDF。
+- 儲存：Supabase Storage 儲存原始音檔與產出譜面；Supabase Postgres 儲存作業、資產與事件紀錄。
+- 鑑權：Supabase Auth 提供使用者登入註冊，前端持 JWT，FastAPI 以 Supabase 提供的 JWKS 驗證令牌。
+- 背景工作：Celery 任務負責音訊下載、轉譜、格式輸出，並以 Webhook/輪詢回報進度。
+- 觀測性：結合 OpenTelemetry (OTLP) 與 Supabase Logflare 收集事件，Sentry 監控前後端錯誤。
+- 佈署：Docker Compose（本機）與容器化上雲（如 AWS ECS/Fargate），Redis 與 Supabase 分別托管。
+- 專案骨架：使用 Poetry 管理依賴，`backend/` 目錄採模組化結構，確保 API 與背景任務可獨立擴充。
+    - `backend/app/main.py`：FastAPI 進入點與路由掛載。
+    - `backend/app/api/v1/`：REST 路由模組，依資源（jobs、assets、uploads 等）拆檔。
+    - `backend/app/services/`：核心業務邏輯層，封裝任務提交、資產管理與通知流程。
+    - `backend/app/repositories/`：SQLModel 與 Supabase 查詢封裝，處理交易與錯誤轉換。
+    - `backend/app/schemas/`：Pydantic Schema 與回應模型，對應 `api.md` 契約。
+    - `backend/app/tasks/`：Celery 任務定義（音訊下載、轉譜、PDF 產生）。
+    - `backend/app/core/`：設定、依賴注入、Supabase/Redis 客戶端、共用常數。
+    - `backend/alembic/`：資料表遷移腳本（與 Supabase schema 對齊）。
+    - `backend/pyproject.toml`：Poetry 設定與指令入口，統一管理開發命令。
+
+## 2. 資料模型
+| 資料表/集合 | 主要欄位 | 描述 |
+| --- | --- | --- |
+| users (Supabase Auth) | id, email, app_metadata | 使用者基本資料與權限，透過 Supabase 管理。|
+| profiles | user_id(FK), display_name, avatar_url, created_at | 額外個人化資料，與 users 一對一。|
+| transcription_jobs | id, user_id, source_type(enum: local,youtube), source_uri, storage_object_path, instrument_modes(jsonb), model_profile(enum), status(enum: pending,processing,rendering,completed,failed), progress(float), error_message, created_at, updated_at | 記錄一次轉譜作業及狀態。|
+| job_events | id, job_id(FK), stage(enum), message, payload(jsonb), created_at | 作業生命週期事件，用於除錯與前端時間軸。|
+| score_assets | id, job_id(FK), instrument(enum), format(enum: midi,musicxml,pdf), storage_object_path, duration_seconds, page_count, created_at | 每個作業產出的檔案資源。|
+| processing_metrics | id, job_id(FK), latency_ms, cpu_usage, memory_mb, model_versions(jsonb), created_at | 蒐集性能與版本資訊，用於監控與回溯。|
+| presets | id, name, description, instrument_modes(jsonb), tempo_hint, visibility(enum: public,private) | 預設配置，讓使用者快速選擇常用樂器組合。|
+
+## 3. 關鍵流程
+1. 使用者登入：Flutter 透過 Supabase Auth 登入，儲存 access token。 
+2. 上傳本地音檔：前端讀取檔案後直接上傳至 Supabase Storage (signed URL)，同時呼叫 FastAPI 建立作業紀錄。 
+3. 提交 YouTube 連結：前端送出連結，後端排入下載任務 (yt-dlp)，完成後轉入音訊處理。 
+4. 轉譜流程：Celery 任務依序進行音訊前處理 → 音軌分離 → 音高/節奏偵測 → 樂器分派 → 產出 MIDI/MusicXML → 呼叫 MuseScore CLI 轉出 PDF。 
+5. 進度回報：任務將各階段以 job_events 紀錄並推播 (WebSocket) 或提供輪詢 API。 
+6. 成果下載：任務完成後，以 score_assets 紀錄生成檔案位置，前端透過簽名網址下載。 
+7. 失敗復原：任務失敗時更新狀態與 error_message，提供重新提交或回報。 
+
+## 4. 虛擬碼
+`pseudo
+function submit_job(user, payload):
+    assert user.is_authenticated
+    job = create_transcription_job(payload)
+    enqueue_celery_task('process_job', job.id)
+    return job
+
+worker process_job(job_id):
+    job = load_job(job_id)
+    update_status(job, 'processing')
+    audio_path = ensure_audio(job)
+    separated_tracks = separate_stems(audio_path)
+    midi_tracks = []
+    for instrument in job.instrument_modes:
+        track_audio = mix_for_instrument(separated_tracks, instrument)
+        midi = transcribe_to_midi(track_audio, instrument)
+        midi_tracks.append((instrument, midi))
+    musicxml_map = render_musicxml(midi_tracks)
+    assets = persist_assets(job, midi_tracks, musicxml_map)
+    generate_pdfs(assets.musicxml)
+    update_status(job, 'completed', assets=assets)
+    notify_user(job.user_id, job)
+
+function persist_assets(job, midi_tracks, musicxml_map):
+    for (instrument, midi) in midi_tracks:
+        path = upload_to_storage(midi)
+        create_score_asset(job, instrument, 'midi', path)
+    for (instrument, xml) in musicxml_map:
+        xml_path = upload_to_storage(xml)
+        create_score_asset(job, instrument, 'musicxml', xml_path)
+    pdf_paths = render_pdf_from_xml(musicxml_map)
+    for (instrument, pdf_path) in pdf_paths:
+        create_score_asset(job, instrument, 'pdf', pdf_path)
+    return fetch_assets(job.id)
+`
+
+## 5. 系統脈絡圖
+`mermaid
+graph LR
+    User((使用者)) -->|操作| FlutterApp[Flutter App]
+    FlutterApp -->|REST/WebSocket| FastAPI[(FastAPI API Gateway)]
+    FastAPI -->|Auth/Storage API| Supabase[(Supabase 平台)]
+    FastAPI -->|推送任務| CeleryWorker[Celery 工作者]
+    CeleryWorker -->|讀寫| Supabase
+    CeleryWorker -->|緩存| Redis[(Redis 任務佇列)]
+    CeleryWorker -->|模型推論| MLModels[(音訊/樂譜模型)]
+    User -->|下載成果| Supabase
+`
+
+## 6. 容器/部署概觀
+`mermaid
+graph TD
+    subgraph 使用者裝置
+        A[Flutter 應用] 
+    end
+    subgraph 雲端基礎設施
+        subgraph 容器叢集
+            B[fastapi-app 容器]
+            C[celery-worker 容器]
+            D[celery-beat 計畫排程]
+        end
+        E[(Redis 服務)]
+        F[(Supabase 托管)]
+        G[(物件儲存，用於大檔備援)]
+    end
+    A --> B
+    B --> E
+    C --> E
+    B --> F
+    C --> F
+    C --> G
+`
+
+## 7. 模組關係圖（Backend / Frontend）
+**Backend**
+`mermaid
+graph TD
+    API[路由層]
+    Service[服務層]
+    Repo[Repository]
+    Storage[Storage 客戶端]
+    Queue[任務排程]
+    ML[音訊/譜面處理模組]
+
+    API --> Service --> Repo --> SupaDB[(Supabase Postgres)]
+    Service --> Queue --> Worker[Celery Worker]
+    Worker --> ML --> Storage[(Supabase Storage)]
+    Worker --> Repo
+`
+**Frontend**
+`mermaid
+graph TD
+    Router[路由 & Navigator]
+    StateManagers[Riverpod Providers]
+    Upload[上傳模組]
+    JobList[作業清單]
+    JobDetail[作業詳情]
+    Download[下載模組]
+    Auth[認證模組]
+
+    Router --> Auth
+    Router --> JobList
+    Router --> JobDetail
+    StateManagers --> Upload
+    StateManagers --> JobList
+    StateManagers --> JobDetail
+    JobDetail --> Download
+`
+
+## 8. 序列圖（YouTube 轉譜流程）
+`mermaid
+sequenceDiagram
+    participant U as 使用者
+    participant F as Flutter App
+    participant A as FastAPI
+    participant Q as Celery Queue
+    participant W as Worker
+    participant S as Supabase
+
+    U->>F: 提供 YouTube 連結 + 選擇樂器
+    F->>A: POST /jobs (payload)
+    A->>S: 建立 job 記錄 (status=pending)
+    A->>Q: 推入 process_job 任務
+    A-->>F: 回傳 job 內容
+    W->>S: 取得 job & 更新 status=processing
+    W->>YouTube: 下載音訊
+    W->>W: 分離音軌/轉譜/生成格式
+    W->>S: 上傳檔案、建立 score_assets
+    W->>S: 更新 job status=completed
+    F->>A: GET /jobs/{id}
+    A->>S: 讀取 job + assets
+    A-->>F: 回傳完成狀態與下載連結
+`
+
+## 9. ER 圖
+`mermaid
+erDiagram
+    USERS ||--o{ PROFILES : 擁有
+    USERS ||--o{ TRANSCRIPTION_JOBS : 建立
+    TRANSCRIPTION_JOBS ||--o{ JOB_EVENTS : 產生
+    TRANSCRIPTION_JOBS ||--o{ SCORE_ASSETS : 生成
+    TRANSCRIPTION_JOBS ||--o{ PROCESSING_METRICS : 產出
+    USERS ||--o{ PRESETS : 建立
+`
+
+## 10. 類別圖（後端關鍵類別）
+`mermaid
+classDiagram
+    class JobService {
+        +create_job(data)
+        +get_job(id)
+        +list_jobs(user)
+        +update_status(job, status, meta)
+    }
+    class AudioIngestor {
+        +ensure_audio(job)
+        +download_youtube(url)
+        +normalize_audio(path)
+    }
+    class TranscriptionPipeline {
+        +separate_stems(path)
+        +transcribe(track, instrument)
+        +arrange_tracks(midi_tracks)
+    }
+    class AssetPublisher {
+        +save_midi(job, instrument, midi)
+        +save_musicxml(job, instrument, xml)
+        +render_pdf(xml_path)
+        +register_asset(job, metadata)
+    }
+    class NotificationService {
+        +emit_event(job, stage, message)
+        +notify_user(job)
+    }
+
+    JobService --> AudioIngestor
+    JobService --> TranscriptionPipeline
+    JobService --> AssetPublisher
+    JobService --> NotificationService
+`
+
+## 11. 流程圖（作業建立至完成）
+`mermaid
+flowchart TD
+    A[建立作業請求] --> B{來源類型?}
+    B -->|本地檔案| C[生成簽名上傳 URL]
+    C --> D[上傳完成]
+    B -->|YouTube| E[佇列下載任務]
+    D --> F[排程 process_job]
+    E --> F
+    F --> G[音訊前處理]
+    G --> H[分離/轉譜]
+    H --> I[生成 MIDI/MusicXML]
+    I --> J[渲染 PDF]
+    J --> K[上傳資產]
+    K --> L[更新狀態 completed]
+    L --> M[通知使用者]
+`
+
+## 12. 狀態圖（Transcription Job）
+`mermaid
+stateDiagram-v2
+    [*] --> pending
+    pending --> processing: 任務開始
+    processing --> rendering: 格式輸出
+    rendering --> completed: 成功
+    processing --> failed: 錯誤
+    rendering --> failed: 產出失敗
+    failed --> pending: 使用者重新提交
+    completed --> [*]
+`
