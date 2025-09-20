@@ -48,9 +48,10 @@ class JobService:
         return self._repository.get_job(job_id=job_id, user_id=user_id)
 
     def list_job_assets(self, *, user_id: UUID, job_id: UUID) -> Optional[List[ScoreAsset]]:
-        """取得作業資產清單。"""
+        """取得指定作業的資產列表，僅允許作業擁有者存取。"""
 
         job = self._repository.get_job(job_id=job_id, user_id=user_id)
         if job is None:
             return None
-        return self._repository.list_assets(job_id=job_id, user_id=user_id)
+        assets = self._repository.list_assets(job_id=job_id, user_id=user_id)
+        return sorted(assets, key=lambda item: item.created_at)

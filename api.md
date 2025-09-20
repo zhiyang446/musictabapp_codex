@@ -57,7 +57,9 @@ drums | bass | piano | guitar | strings | custom:<name>
 
 ## 上傳相關 API
 ### POST /v1/uploads/audio
-取得 Supabase 簽名網址，供前端直接上傳本地音檔。
+於 Supabase Storage 建立簽名上傳資訊，僅允許音訊檔案。
+- 呼叫者必須通過 JWT 驗證；儲存路徑格式固定為 `{user_id}/audio/{隨機檔名}`。
+- `mimeType` 必須以 `audio/` 開頭，`fileSize` 需介於 1 byte 與 `UPLOAD_MAX_BYTES`（預設 50 MiB）之間。
 
 **Request Body**
 `json
@@ -81,9 +83,9 @@ drums | bass | piano | guitar | strings | custom:<name>
   "storageObjectPath": "user-uuid/audio/demo.wav"
 }
 `
-- 400 Bad Request：檔案過大或副檔名不允許。
+- 400 Bad Request → ErrorResponse（檔名或 MIME 型態不合法）
+- 413 Payload Too Large → ErrorResponse（超過大小限制）
 
-## 作業管理 API
 ### POST /v1/jobs
 建立新的轉譜作業。
 
@@ -130,6 +132,7 @@ drums | bass | piano | guitar | strings | custom:<name>
 
 ### GET /v1/jobs/{jobId}/assets
 取得作業產出資源清單。
+- 僅回傳屬於目前使用者的資產，並依 createdAt 升序排列。
 - 200 OK
 `json
 {

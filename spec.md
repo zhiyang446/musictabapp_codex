@@ -7,7 +7,7 @@
 - 儲存：Supabase Storage 儲存原始音檔與產出譜面；Supabase Postgres 儲存作業、資產與事件紀錄。
 - 鑑權：Supabase Auth 提供使用者登入註冊，前端持 JWT，FastAPI 透過自訂的 JWKSProvider 快取 Supabase 提供的 JWKS 金鑰 300 秒並驗證令牌；若快取過期會自動重新拉取，任何簽章解析或 aud/iss 驗證失敗皆回應 401 Unauthorized。
 - 背景工作：Celery 任務負責音訊下載、轉譜、格式輸出，並以 Webhook/輪詢回報進度。
-- 環境變數：後端服務需要設定 SUPABASE_JWKS_URL、SUPABASE_JWT_ISSUER、SUPABASE_JWT_AUDIENCE 等認證相關環境變數；若缺漏 JWKS URL 啟動時應立刻失敗以避免繞過驗證。
+- 環境變數：後端服務需要設定 SUPABASE_JWKS_URL、SUPABASE_JWT_ISSUER、SUPABASE_JWT_AUDIENCE、SUPABASE_STORAGE_BUCKET、SUPABASE_SERVICE_ROLE_KEY 等認證相關環境變數；若缺漏 JWKS URL 或 Storage 設定啟動時應立刻失敗。
 - 觀測性：結合 OpenTelemetry (OTLP) 與 Supabase Logflare 收集事件，Sentry 監控前後端錯誤。
 - 佈署：Docker Compose（本機）與容器化上雲（如 AWS ECS/Fargate），Redis 與 Supabase 分別托管。
 - 專案骨架：使用 Poetry 管理依賴，`backend/` 目錄採模組化結構，確保 API 與背景任務可獨立擴充。
@@ -57,13 +57,14 @@
 
 ## 3. 關鍵流程
 1. 使用者登入：Flutter 透過 Supabase Auth 登入，儲存 access token，後端在每次 API 呼叫時會解析 Authorization Header，透過 JWKSProvider 快取 Supabase JWKS 並驗證簽章、aud/iss，失敗則立即回傳 401。 
-2. 上傳本地音檔：前端讀取檔案後直接上傳至 Supabase Storage (signed URL)，同時呼叫 FastAPI 建立作業紀錄。 
+2. 上傳本地音檔：前端先呼叫 POST /v1/uploads/audio 取得簽名上傳資訊，再使用回傳的 uploadUrl 以 HTTP PUT 將音檔寫入 Supabase Storage，最後帶著 storageObjectPath 呼叫 FastAPI 建立作業紀錄。 
 3. 提交 YouTube 連結：前端送出連結，後端排入下載任務 (yt-dlp)，完成後轉入音訊處理。 
 4. 轉譜流程：Celery 任務依序進行音訊前處理 → 音軌分離 → 音高/節奏偵測 → 樂器分派 → 產出 MIDI/MusicXML → 呼叫 MuseScore CLI 轉出 PDF。 
 5. 進度回報：任務將各階段以 job_events 紀錄並推播 (WebSocket) 或提供輪詢 API。 
 6. 成果下載：任務完成後，以 score_assets 紀錄生成檔案位置，前端透過簽名網址下載。 
-7. 使用者查詢：前端以 GET /v1/jobs/{job_id} 取得單筆作業詳情，服務會驗證作業歸屬於該 user_id；若查無或非本人則統一回傳 404。 
-8. 失敗復原：任務失敗時更新狀態與 error_message，提供重新提交或回報。 
+7. 作業詳情：前端以 GET /v1/jobs/{job_id} 取得單筆作業資訊，服務會驗證作業歸屬於該 user_id；若查無或非本人則統一回傳 404。 
+8. 資產瀏覽：前端以 GET /v1/jobs/{job_id}/assets 取得產出資源列表，僅回傳符合使用者與作業的資產，並依 created_at 升冪排序。 
+9. 失敗復原：任務失敗時更新狀態與 error_message，提供重新提交或回報。 
 
 ## 4. 虛擬碼
 `pseudo
@@ -295,3 +296,8 @@ stateDiagram-v2
     completed --> [*]
 `
 
+## 13. 測試計畫
+- 單元測試：ackend/tests/test_security.py 驗證 Supabase JWT 解析流程，涵蓋成功、缺失 Header、錯誤 kid/sub、多 audience 等情境。
+- 作業 API 測試：ackend/tests/test_jobs.py 覆蓋列表、建立、詳情、資產列表等情境，包含 404 與空結果檢查。
+- 執行方式：使用 poetry run pytest tests 進行整體測試；CI 可整合同指令於 PR 驗證。
+- 資料隔離：測試採用 Fake service 取代資料層，確保不依賴實際資料庫或 Supabase。

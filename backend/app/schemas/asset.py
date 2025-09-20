@@ -18,6 +18,7 @@ class ScoreAssetResource(BaseModel):
     instrument: str
     format: str
     storage_object_path: str = Field(serialization_alias="storageObjectPath")
+    download_url: Optional[str] = Field(default=None, serialization_alias="downloadUrl")
     duration_seconds: Optional[int] = Field(default=None, serialization_alias="durationSeconds")
     page_count: Optional[int] = Field(default=None, serialization_alias="pageCount")
     created_at: datetime = Field(serialization_alias="createdAt")

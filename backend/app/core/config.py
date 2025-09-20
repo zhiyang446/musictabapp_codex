@@ -10,9 +10,13 @@ class Settings(BaseSettings):
     project_name: str = "MusicTab API"
     supabase_url: str | None = None
     supabase_api_key: str | None = None
+    supabase_service_role_key: str | None = None
     supabase_jwks_url: str | None = None
     supabase_jwt_audience: str = "authenticated"
     supabase_jwt_issuer: str | None = None
+    supabase_storage_bucket: str = "transcriptions"
+    upload_signed_url_expires: int = 900
+    upload_max_bytes: int = 50 * 1024 * 1024
     redis_url: str = "redis://localhost:6379/0"
     celery_broker_url: str | None = None
     celery_result_url: str | None = None
