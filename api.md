@@ -2,7 +2,8 @@
 
 ## 認證方式
 - 使用 Supabase Auth JWT，於 HTTP Header 加入 Authorization: Bearer <token>。
-- 未帶入或無效 JWT 皆回傳 401 Unauthorized。
+- 未帶入或無效 JWT 皆回傳 401 Unauthorized，並於回應標頭附加 WWW-Authenticate: Bearer。
+- 後端透過 JWKSProvider 從 SUPABASE_JWKS_URL 快取 Supabase JWKS 金鑰 300 秒，依 SUPABASE_JWT_AUDIENCE（預設 authenticated）與 SUPABASE_JWT_ISSUER 驗證 JWT，無法取得或驗證失敗同樣回傳 401。
 
 ## Content-Type
 - 請求與回應皆為 pplication/json，除非另有說明。
@@ -125,7 +126,7 @@ drums | bass | piano | guitar | strings | custom:<name>
 ### GET /v1/jobs/{jobId}
 取得單一作業。
 - 200 OK → JobResource
-- 404 Not Found
+- 404 Not Found → ErrorResponse（作業不存在或不屬於請求者）
 
 ### GET /v1/jobs/{jobId}/assets
 取得作業產出資源清單。
@@ -135,6 +136,7 @@ drums | bass | piano | guitar | strings | custom:<name>
   "data": [ScoreAssetResource]
 }
 `
+- 404 Not Found → ErrorResponse（作業不存在或不屬於請求者）
 
 ### GET /v1/jobs/{jobId}/events
 依時間序列回傳事件紀錄。
@@ -209,6 +211,7 @@ drums | bass | piano | guitar | strings | custom:<name>
 ## 錯誤碼列表
 | 代碼 | 說明 |
 | --- | --- |
+| UNAUTHORIZED | Authorization Header 缺失或 JWT 驗證失敗 |
 | VALIDATION_ERROR | 請求參數有誤 |
 | JOB_NOT_FOUND | 找不到作業 |
 | ASSET_NOT_FOUND | 找不到資產 |

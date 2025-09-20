@@ -1,16 +1,15 @@
-﻿"""/v1/jobs API 測試。"""
-from __future__ import annotations
+﻿from __future__ import annotations
 
 from datetime import datetime, timezone
-from typing import List, Tuple
+from typing import Dict, List, Tuple
 from uuid import UUID, uuid4
 
 from fastapi.testclient import TestClient
 
 from app.api.v1.endpoints.jobs import get_job_service
-from app.core.security import get_current_user_id
+from app.core.security import require_current_user_id
 from app.main import app
-from app.models.tables import TranscriptionJob
+from app.models.tables import ScoreAsset, TranscriptionJob
 from app.schemas.job import JobCreateRequest
 from app.services.job_service import JobService
 
@@ -18,10 +17,11 @@ TEST_USER_ID = UUID("00000000-0000-0000-0000-000000000123")
 
 
 class FakeJobService:
-    """測試用的 JobService，回傳固定資料。"""
+    """替身 JobService，提供測試用資料。"""
 
-    def __init__(self, jobs: List[TranscriptionJob]) -> None:
-        self._jobs = jobs
+    def __init__(self, jobs: List[TranscriptionJob], assets: Dict[UUID, List[ScoreAsset]] | None = None) -> None:
+        self._jobs: Dict[UUID, TranscriptionJob] = {job.id: job for job in jobs}
+        self._assets: Dict[UUID, List[ScoreAsset]] = assets or {}
 
     def create_job(self, *, payload: JobCreateRequest, user_id: UUID) -> TranscriptionJob:
         job = TranscriptionJob(
@@ -37,23 +37,38 @@ class FakeJobService:
         job.id = uuid4()
         job.created_at = datetime.now(timezone.utc)
         job.updated_at = datetime.now(timezone.utc)
+        self._jobs[job.id] = job
         return job
 
     def list_jobs(
         self,
         *,
+        user_id: UUID,
         status: str | None = None,
         limit: int = 20,
         offset: int = 0,
     ) -> Tuple[List[TranscriptionJob], int]:
-        filtered = self._jobs
+        filtered = [job for job in self._jobs.values() if job.user_id == user_id]
         if status:
             filtered = [job for job in filtered if job.status == status]
-        return filtered[offset : offset + limit], len(filtered)
+        sliced = filtered[offset : offset + limit]
+        return sliced, len(filtered)
+
+    def get_job(self, *, user_id: UUID, job_id: UUID) -> TranscriptionJob | None:
+        job = self._jobs.get(job_id)
+        if job is None or job.user_id != user_id:
+            return None
+        return job
+
+    def list_job_assets(self, *, user_id: UUID, job_id: UUID) -> List[ScoreAsset] | None:
+        job = self.get_job(user_id=user_id, job_id=job_id)
+        if job is None:
+            return None
+        return self._assets.get(job_id, [])
 
 
 def build_job_model(status: str) -> TranscriptionJob:
-    """建立測試用的作業模型。"""
+    """建立具備預設欄位的作業模型。"""
 
     job = TranscriptionJob(
         user_id=TEST_USER_ID,
@@ -85,8 +100,10 @@ def override_current_user() -> UUID:
 
 
 def test_list_jobs_returns_data() -> None:
+    """確認列表 API 可回傳全部作業與總筆數。"""
+
     app.dependency_overrides[get_job_service] = override_job_service
-    app.dependency_overrides[get_current_user_id] = override_current_user
+    app.dependency_overrides[require_current_user_id] = override_current_user
     client = TestClient(app)
 
     try:
@@ -97,12 +114,14 @@ def test_list_jobs_returns_data() -> None:
         assert len(payload['data']) == 2
     finally:
         app.dependency_overrides.pop(get_job_service, None)
-        app.dependency_overrides.pop(get_current_user_id, None)
+        app.dependency_overrides.pop(require_current_user_id, None)
 
 
 def test_list_jobs_filter_by_status() -> None:
+    """確認列表 API 可依狀態過濾。"""
+
     app.dependency_overrides[get_job_service] = override_job_service
-    app.dependency_overrides[get_current_user_id] = override_current_user
+    app.dependency_overrides[require_current_user_id] = override_current_user
     client = TestClient(app)
 
     try:
@@ -113,12 +132,14 @@ def test_list_jobs_filter_by_status() -> None:
         assert payload['data'][0]['status'] == 'completed'
     finally:
         app.dependency_overrides.pop(get_job_service, None)
-        app.dependency_overrides.pop(get_current_user_id, None)
+        app.dependency_overrides.pop(require_current_user_id, None)
 
 
 def test_create_job_success() -> None:
+    """確認建立作業成功回傳 pending 狀態。"""
+
     app.dependency_overrides[get_job_service] = override_job_service
-    app.dependency_overrides[get_current_user_id] = override_current_user
+    app.dependency_overrides[require_current_user_id] = override_current_user
     client = TestClient(app)
 
     try:
@@ -139,4 +160,47 @@ def test_create_job_success() -> None:
         assert body['sourceUri'] == 'https://youtu.be/demo123'
     finally:
         app.dependency_overrides.pop(get_job_service, None)
-        app.dependency_overrides.pop(get_current_user_id, None)
+        app.dependency_overrides.pop(require_current_user_id, None)
+
+
+def test_retrieve_job_success() -> None:
+    """確認可取得屬於使用者的單筆作業。"""
+
+    job = build_job_model('completed')
+    service = FakeJobService([job])
+    app.dependency_overrides[get_job_service] = lambda: service  # type: ignore[return-value]
+    app.dependency_overrides[require_current_user_id] = override_current_user
+    client = TestClient(app)
+
+    try:
+        response = client.get(f'/v1/jobs/{job.id}')
+        assert response.status_code == 200
+        payload = response.json()
+        assert payload['id'] == str(job.id)
+        assert payload['status'] == job.status
+    finally:
+        app.dependency_overrides.pop(get_job_service, None)
+        app.dependency_overrides.pop(require_current_user_id, None)
+
+
+def test_retrieve_job_not_found() -> None:
+    """當作業不存在或非本人時應回傳 404。"""
+
+    other_job = build_job_model('completed')
+    other_job.user_id = UUID('00000000-0000-0000-0000-000000000999')
+    service = FakeJobService([other_job])
+    app.dependency_overrides[get_job_service] = lambda: service  # type: ignore[return-value]
+    app.dependency_overrides[require_current_user_id] = override_current_user
+    client = TestClient(app)
+
+    try:
+        missing_id = uuid4()
+        response = client.get(f'/v1/jobs/{missing_id}')
+        assert response.status_code == 404
+
+        response_other = client.get(f'/v1/jobs/{other_job.id}')
+        assert response_other.status_code == 404
+    finally:
+        app.dependency_overrides.pop(get_job_service, None)
+        app.dependency_overrides.pop(require_current_user_id, None)
+

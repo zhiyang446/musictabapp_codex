@@ -5,8 +5,9 @@
     - 核心套件版本：`flutter_riverpod` 2.5、`go_router` 14、`dio` 5.7、`supabase_flutter` 2.7、`flutter_hooks` 0.20。
 - 後端：FastAPI (Python 3.11) 搭配 Pydantic v2、SQLModel 配合 psycopg 驅動管理資料層、Uvicorn/Gunicorn 作為 ASGI 伺服器、Celery + Redis 處理離線運算；作曲模型採用 basic-pitch、Demucs/Spleeter 做音軌分離、music21 生成 MusicXML、mido/pretty_midi 產出 MIDI、MuseScore CLI 或 LilyPond 將 MusicXML 轉為 PDF。
 - 儲存：Supabase Storage 儲存原始音檔與產出譜面；Supabase Postgres 儲存作業、資產與事件紀錄。
-- 鑑權：Supabase Auth 提供使用者登入註冊，前端持 JWT，FastAPI 以 Supabase 提供的 JWKS 驗證令牌。
+- 鑑權：Supabase Auth 提供使用者登入註冊，前端持 JWT，FastAPI 透過自訂的 JWKSProvider 快取 Supabase 提供的 JWKS 金鑰 300 秒並驗證令牌；若快取過期會自動重新拉取，任何簽章解析或 aud/iss 驗證失敗皆回應 401 Unauthorized。
 - 背景工作：Celery 任務負責音訊下載、轉譜、格式輸出，並以 Webhook/輪詢回報進度。
+- 環境變數：後端服務需要設定 SUPABASE_JWKS_URL、SUPABASE_JWT_ISSUER、SUPABASE_JWT_AUDIENCE 等認證相關環境變數；若缺漏 JWKS URL 啟動時應立刻失敗以避免繞過驗證。
 - 觀測性：結合 OpenTelemetry (OTLP) 與 Supabase Logflare 收集事件，Sentry 監控前後端錯誤。
 - 佈署：Docker Compose（本機）與容器化上雲（如 AWS ECS/Fargate），Redis 與 Supabase 分別托管。
 - 專案骨架：使用 Poetry 管理依賴，`backend/` 目錄採模組化結構，確保 API 與背景任務可獨立擴充。
@@ -55,13 +56,14 @@
 
 
 ## 3. 關鍵流程
-1. 使用者登入：Flutter 透過 Supabase Auth 登入，儲存 access token。 
+1. 使用者登入：Flutter 透過 Supabase Auth 登入，儲存 access token，後端在每次 API 呼叫時會解析 Authorization Header，透過 JWKSProvider 快取 Supabase JWKS 並驗證簽章、aud/iss，失敗則立即回傳 401。 
 2. 上傳本地音檔：前端讀取檔案後直接上傳至 Supabase Storage (signed URL)，同時呼叫 FastAPI 建立作業紀錄。 
 3. 提交 YouTube 連結：前端送出連結，後端排入下載任務 (yt-dlp)，完成後轉入音訊處理。 
 4. 轉譜流程：Celery 任務依序進行音訊前處理 → 音軌分離 → 音高/節奏偵測 → 樂器分派 → 產出 MIDI/MusicXML → 呼叫 MuseScore CLI 轉出 PDF。 
 5. 進度回報：任務將各階段以 job_events 紀錄並推播 (WebSocket) 或提供輪詢 API。 
 6. 成果下載：任務完成後，以 score_assets 紀錄生成檔案位置，前端透過簽名網址下載。 
-7. 失敗復原：任務失敗時更新狀態與 error_message，提供重新提交或回報。 
+7. 使用者查詢：前端以 GET /v1/jobs/{job_id} 取得單筆作業詳情，服務會驗證作業歸屬於該 user_id；若查無或非本人則統一回傳 404。 
+8. 失敗復原：任務失敗時更新狀態與 error_message，提供重新提交或回報。 
 
 ## 4. 虛擬碼
 `pseudo
