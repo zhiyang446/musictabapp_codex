@@ -17,6 +17,7 @@ class Settings(BaseSettings):
     supabase_storage_bucket: str = "transcriptions"
     upload_signed_url_expires: int = 900
     upload_max_bytes: int = 50 * 1024 * 1024
+    job_submission_active_limit: int = 3
     redis_url: str = "redis://localhost:6379/0"
     celery_broker_url: str | None = None
     celery_result_url: str | None = None

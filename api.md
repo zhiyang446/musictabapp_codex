@@ -142,7 +142,8 @@ drums | bass | piano | guitar | strings | custom:<name>
 - 404 Not Found → ErrorResponse（作業不存在或不屬於請求者）
 
 ### GET /v1/jobs/{jobId}/events
-依時間序列回傳事件紀錄。
+取得作業事件紀錄，依 `createdAt` 升序排列。
+- 僅回傳屬於請求者的作業，否則回傳 404。
 - 200 OK
 `json
 {
@@ -156,11 +157,31 @@ drums | bass | piano | guitar | strings | custom:<name>
   ]
 }
 `
+- 404 Not Found → ErrorResponse（作業不存在或不屬於請求者）
 
 ### GET /v1/jobs/{jobId}/stream
-建立 Server-Sent Events 連線，持續推送作業事件。
-- Response 	ext/event-stream
-- 事件格式：event:<stage>\ndata:<json>\n\n
+以 Server-Sent Events 推送指定 job 的即時事件。
+
+- 授權：需帶 Authorization: Bearer <token>，若 job 不存在或不屬於該使用者則回傳 404 JOB_NOT_FOUND。
+- 回應格式：Content-Type 為 text/event-stream，Header 包含 Cache-Control: no-cache、Connection: keep-alive、X-Accel-Buffering: no。
+- 初次連線：以 createdAt 升冪（同時間再依 id 升冪）補齊所有未傳送的事件。
+- Last-Event-ID：若 Header 存在，必須為 UUID 且該事件需屬於該 job；格式錯誤或查無事件時回傳 400 INVALID_LAST_EVENT_ID。
+- 續傳查詢：帶入 Last-Event-ID 時，查詢條件需確保 createdAt 與 id 都嚴格大於最後一次輸出的事件，避免重複。
+- 輪詢頻率：每 1 秒輪詢 job_events 是否新增資料。
+- 心跳：若 30 秒內沒有新事件則傳送 :keep-alive 空訊息維持連線。
+- 連線中斷：偵測 request.is_disconnected() 為 true 時立即停止串流。
+
+**Event 範例**
+```text
+id:<eventId>
+event:<stage>
+data:{"stage": "...", "message": "...", "payload": {...}, "createdAt": "ISO8601"}
+```
+
+**Responses**
+- 200 OK (text/event-stream)
+- 400 Bad Request - ErrorResponse(INVALID_LAST_EVENT_ID)
+- 404 Not Found - ErrorResponse(JOB_NOT_FOUND)
 
 ### POST /v1/jobs/{jobId}/retry
 重送失敗作業。
